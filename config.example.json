@@ -1,0 +1,17 @@
+{
+  "worker": 8,
+  "scheduler": "fifo",
+  "downloader": "http",
+  "output": "quotes.jsonl",
+  "sqlite": "",
+  "user_agent": "my-spider-demo/0.2",
+  "timeout": "10s",
+  "max_attempts": 3,
+  "retry_base_delay": "500ms",
+  "retry_max_delay": "8s",
+  "global_qps": 5,
+  "domain_qps": {
+    "quotes.toscrape.com": 2
+  },
+  "log_level": "info"
+}
