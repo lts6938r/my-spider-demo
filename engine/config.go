@@ -27,6 +27,7 @@ type Config struct {
 	Output         string             `json:"output"`       // 非空则追加 JSONL 文件管道
 	SQLite         string             `json:"sqlite"`       // 非空则追加 SQLite 管道（数据库文件路径）
 	SQLiteTable    string             `json:"sqlite_table"` // SQLite 表名，默认 items
+	Checkpoint     string             `json:"checkpoint"`   // 断点续爬状态文件；非空时覆盖 duper 参数
 	UserAgent      string             `json:"user_agent"`
 	Timeout        Duration           `json:"timeout"`          // 单请求整体超时
 	MaxAttempts    int                `json:"max_attempts"`     // 重试总次数（含首次）
@@ -97,6 +98,11 @@ func NewEngineFromConfig(cfg *Config, duper dedup.Duper, pipes ...pipeline.Pipel
 		cfg = DefaultConfig()
 	}
 	lg := newLogger(cfg.LogLevel)
+
+	// 断点续爬：配置了状态文件即启用 Checkpoint 去重器（覆盖传入的 duper）
+	if cfg.Checkpoint != "" {
+		duper = dedup.NewCheckpoint(cfg.Checkpoint)
+	}
 
 	var mws []middleware.Middleware
 	mws = append(mws, middleware.LoggingMiddleware(lg))

@@ -79,6 +79,15 @@ func (s WiredSpider) parseList(resp *spider.Response) spider.Result {
 	return res
 }
 
+// ParseFor 实现 engine.ResumeResolver：断点恢复时按 URL 重挂解析函数。
+// magazine 列表页 → parseList；/story/ 文章页 → parseArticle。
+func (s WiredSpider) ParseFor(url string) spider.ParseFunc {
+	if strings.Contains(url, "/magazine") {
+		return s.parseList
+	}
+	return parseArticle
+}
+
 func parseArticle(resp *spider.Response) spider.Result {
 	title := ""
 	if m := ogTitleRe.FindStringSubmatch(resp.Text()); m != nil {
@@ -97,6 +106,7 @@ func parseArticle(resp *spider.Response) spider.Result {
 func main() {
 	limit := flag.Int("limit", 5, "最多抓取的文章数")
 	configPath := flag.String("config", "configs/wired.json", "JSON 配置文件路径")
+	maxDur := flag.Duration("max-duration", 0, "运行时长上限（如 12s），到点优雅停机并保存断点；0 = 不限")
 	flag.Parse()
 
 	cfg, err := engine.LoadConfig(*configPath)
@@ -106,6 +116,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *maxDur > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *maxDur)
+		defer cancel()
+	}
 
 	eng, err := engine.NewEngineFromConfig(cfg, dedup.NewHashSetDuper(), pipeline.ConsolePipeline{})
 	if err != nil {

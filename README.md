@@ -31,6 +31,13 @@ go run ./cmd/rss -limit 5                # 真实场景：The Verge RSS → 文�
 go run ./cmd/wired -limit 5              # 真实场景：列表页解析 + HTTP→CDP 降级 + 低频抓取
 ```
 
+断点续爬（configs/wired.json 已开启 `checkpoint`）：中断（Ctrl-C / `-max-duration`）时保存进度，重启后已完成的页面零重抓、未完成的自动续跑：
+
+```bash
+go run ./cmd/wired -limit 20 -max-duration 10s   # 跑 10 秒优雅中断，保存断点
+go run ./cmd/wired -limit 20                     # 重启续爬：只下载未完成的，结束清除断点
+```
+
 `cmd/rss` 展示"RSS 发现 → 页面抓取"的两级数据流：框架的 `ParseRSS` 解析 RSS 2.0 / RSS 1.0(RDF) / Atom 提取条目链接（自动识别格式，含 ISO-8859-1 字符集转换），Spider 决定入队策略；文章页下载后提取标题（og:title），输出含页面体积等字段。
 
 - stdout 输出 item（JSON 行），stderr 输出结构化日志（JSON 行），`> out.jsonl` 可分离两者
@@ -106,6 +113,7 @@ func main() {
 | `output` | 空 | 非空则追加 JSONL 文件管道（追加模式，不覆盖历史） |
 | `sqlite` | 空 | 非空则追加 SQLite 管道（数据库文件路径） |
 | `sqlite_table` | `items` | SQLite 表名（白名单校验） |
+| `checkpoint` | 空 | 断点续爬状态文件：中断保存 visited+pending，重启自动续爬（Spider 需实现 `ParseFor` 钩子） |
 | `user_agent` | `spider/0.1` | 未显式设置 UA 的请求使用 |
 | `timeout` | `30s` | 单请求整体超时（字符串写法） |
 | `max_attempts` | `3` | 重试总次数（含首次）；4xx 不重试，429/5xx/传输错误重试 |

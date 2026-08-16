@@ -13,5 +13,6 @@
   "domain_qps": {
     "www.wired.com": 1
   },
-  "log_level": "info"
+  "log_level": "info",
+  "checkpoint": "wired.state.json"
 }

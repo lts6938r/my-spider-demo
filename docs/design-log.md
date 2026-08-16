@@ -226,3 +226,16 @@ Priority（V4 优先级队列才消费）、RetryCount（V3 重试才消费）�
 **代价与收获**：收获是物理边界强制低耦合（scheduler 无法伸手摸 downloader 的内部）+ 72 个测试按包独立运行（改中间件只跑 middleware 包的测试）；代价是引用要带包名、`lazyCDP` 等内部构造器需要导出（`NewLazyCDP`）。单包 vs 多包在此规模都成立——拆是因为边界已验证稳定且被明确要求，不是因为单包错误。
 
 **机械重构的方法教训**：批量 sed/python 替换会产生"字段名被误限定"（`Duper dedup.Duper`）、"函数名被误伤"（`TestEngineWithRetryMiddleware` → `TestEngineWithmiddleware.RetryMiddleware`）、"双限定"（`scheduler.scheduler.`）三类损伤——全部被 `go vet` 逐个暴露，修完 72 测试零丢失。工具能加速机械部分，边界（）和上下文（函数名、字段名）仍要人盯。
+
+
+## 020 断点续爬（2026-08-16）
+
+**核心难题：Request 携带 ParseFunc（闭包），不可序列化。** 解法：队列快照只存 URL，重启后由 Spider 的可选钩子 `ParseFor(url)` 重新挂解析函数（Scrapy 的"命名回调注册表"的函数版）。Spider 不实现钩子时恢复的请求只下载不解析——降级但可预测。
+
+**状态模型**：visited（已完成，重启不重抓）与 pending（已发现未完成，重新入队）两类，由 `dedup.Checkpoint` 承载——它实现 Duper 接口做去重，同时实现 Load/Complete/Save/Clear 四个可选能力方法，引擎经类型断言探测接入（与 io.Closer 同款模式，零编译期耦合）。完成语义有区分：**传输成功即 visited（含解析失败——重下修不了解析 bug）；传输失败留 pending，下次运行重试**（瞬时故障值得再给机会）。
+
+**两个非显然的坑**：其一，Load 恢复时 pending 不进内存表——否则恢复的 URL 会被自己的 Visit 判重，永远入不了队（自锁）。其二，停机排空阶段新产出的子请求在有断点时照常登记入队（本轮不执行、随 Save 落盘）——否则这些链接因父页已 visited 而永远无法再被发现，静默丢数据。
+
+**写入安全**：Save 用临时文件 + rename，避免写一半崩溃留下损坏文件；损坏文件在 Load 时显式报错而非静默。**已知局限**（文档化而非复杂化）：崩溃（非优雅停机）不保存——需要 journaling/周期性快照；列表页内容在两次运行间更新不会被重新发现（visited 无 TTL）。
+
+**测试**：闸门服务器实现确定性中断——handler 在闸门放行前挂起，测试精确控制"哪些请求已完成"；e2e 断言重启后 visited 页面服务端恰好 1 次命中、pending 全部续爬、两轮 item 无重复、完成后断点清除。真实场景验证：20 篇文章 10 秒中断（visited 6 / pending 15），续跑恰好 15 次下载、20 条 item 全唯一。

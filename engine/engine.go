@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -25,6 +26,25 @@ const DefaultWorkers = 8
 type Spider interface {
 	Name() string
 	StartRequests() []*spider.Request
+}
+
+// ResumeResolver 由支持断点续爬的 Spider 可选实现：
+// 为重启后恢复的未完成请求重新指定解析函数。
+// Request 的 ParseFunc 是闭包、不可序列化，断点只存 URL——
+// 恢复时靠这个钩子把"URL → 解析逻辑"的映射补回来。
+// 未实现时恢复的请求只下载、不解析。
+type ResumeResolver interface {
+	ParseFor(url string) spider.ParseFunc
+}
+
+// checkpointDuper 是断点续爬去重器（dedup.Checkpoint）的完整能力。
+// 经 Duper 类型断言探测接入（可选能力模式，同 io.Closer），
+// 引擎对断点功能无编译期依赖。
+type checkpointDuper interface {
+	Load() ([]string, error)    // 恢复 visited，返回未完成 URL
+	Complete(r *spider.Request) // 请求完成（传输成功）：pending → visited
+	Save() error                // 中断时保存状态
+	Clear() error               // 正常结束后清除
 }
 
 // outcome 是 worker 回传给协调者的执行结果。
@@ -119,6 +139,42 @@ func (e *Engine) RunContext(ctx context.Context, sp Spider) error {
 	// 停机时只有 inflight 会产生结果，queued 直接放弃——
 	// 若混用一个计数，"放弃了一个其实已派发的请求"会让排空永远等不到结果（死锁）。
 	queued, inflight := 0, 0
+
+	// 断点续爬：Duper 实现了可选能力接口（dedup.Checkpoint）时启用。
+	var cp checkpointDuper
+	cp, hasCheckpoint := e.Duper.(checkpointDuper)
+
+	// 恢复上次未完成的请求。Request 携带 ParseFunc（闭包）不可序列化，
+	// 队列快照只存 URL，解析函数由 Spider 的可选钩子 ParseFor 重新挂载；
+	// Spider 未实现钩子时恢复的请求只下载不解析。
+	if hasCheckpoint {
+		urls, err := cp.Load()
+		if err != nil {
+			return fmt.Errorf("engine: 加载断点: %w", err)
+		}
+		var resolve func(string) spider.ParseFunc
+		if rr, ok := sp.(ResumeResolver); ok {
+			resolve = rr.ParseFor
+		}
+		for _, u := range urls {
+			var parse spider.ParseFunc // 未实现钩子：只下载不解析
+			if resolve != nil {
+				parse = resolve(u)
+			}
+			req, err := spider.NewRequest("", u, parse)
+			if err != nil {
+				lg.Warn("断点中的 URL 非法，丢弃", "url", u, "err", err)
+				continue
+			}
+			if e.push(req) {
+				queued++
+			}
+		}
+		if len(urls) > 0 {
+			lg.Info("断点恢复", "resumed", len(urls))
+		}
+	}
+
 	for _, r := range sp.StartRequests() {
 		if e.push(r) {
 			queued++
@@ -184,6 +240,19 @@ func (e *Engine) RunContext(ctx context.Context, sp Spider) error {
 		e.handle(o, false)
 	}
 
+	// 断点收尾：中断则保存（visited + pending），完整结束则清除。
+	if hasCheckpoint {
+		if shutdown {
+			if err := cp.Save(); err != nil {
+				lg.Error("保存断点失败", "err", err)
+			} else {
+				lg.Info("断点已保存，下次运行自动续爬")
+			}
+		} else if err := cp.Clear(); err != nil {
+			lg.Warn("清除断点文件失败", "err", err)
+		}
+	}
+
 	lg.Info("engine done",
 		"spider", sp.Name(),
 		"downloaded", e.Downloaded,
@@ -224,6 +293,11 @@ func (e *Engine) handle(o outcome, schedule bool) (scheduled int) {
 		return 0
 	}
 	e.Downloaded++
+	// 断点续爬：传输成功即记完成（含解析失败——重下也修不了解析 bug；
+	// 传输失败不记，留在 pending，下次运行重试）
+	if cp, ok := e.Duper.(checkpointDuper); ok {
+		cp.Complete(o.req)
+	}
 
 	if o.req.Parse == nil {
 		return 0 // 纯触发型请求，响应直接丢弃
@@ -238,6 +312,13 @@ func (e *Engine) handle(o outcome, schedule bool) (scheduled int) {
 			if e.push(r) {
 				scheduled++
 			}
+		}
+	} else if _, ok := e.Duper.(checkpointDuper); ok {
+		// 停机但开着断点：子请求照常登记入队（本轮不会执行），
+		// Save 时随 pending 落盘，下次运行续爬——否则这些链接
+		// 会因父页已 visited 而永远无法再被发现
+		for _, r := range o.result.Requests {
+			e.push(r)
 		}
 	} else {
 		e.Abandoned += len(o.result.Requests)
