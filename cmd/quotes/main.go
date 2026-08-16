@@ -20,7 +20,10 @@ import (
 	"strings"
 	"syscall"
 
-	spider "my-spider-demo"
+	"my-spider-demo/dedup"
+	"my-spider-demo/engine"
+	"my-spider-demo/pipeline"
+	"my-spider-demo/spider"
 )
 
 // V1 用正则演示数据流；结构化解析（goquery）是否引入留到后续评估——
@@ -73,7 +76,7 @@ func main() {
 	configPath := flag.String("config", "", "JSON 配置文件路径（缺省使用默认配置）")
 	flag.Parse()
 
-	cfg, err := spider.LoadConfig(*configPath)
+	cfg, err := engine.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -84,7 +87,7 @@ func main() {
 	defer stop()
 
 	// 中间件链顺序由工厂固定：Logging → Retry → RateLimit → UA → Downloader
-	eng, err := spider.NewEngineFromConfig(cfg, spider.NewHashSetDuper(), spider.ConsolePipeline{})
+	eng, err := engine.NewEngineFromConfig(cfg, dedup.NewHashSetDuper(), pipeline.ConsolePipeline{})
 	if err != nil {
 		log.Fatalf("组装引擎失败: %v", err)
 	}

@@ -1,0 +1,8 @@
+{
+  "worker": 4,
+  "save_dir": "verge-pages",
+  "output": "verge.jsonl",
+  "user_agent": "my-spider-demo/0.2",
+  "timeout": "30s",
+  "global_qps": 3
+}

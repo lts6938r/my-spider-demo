@@ -1,0 +1,17 @@
+{
+  "worker": 2,
+  "downloader": "fallback",
+  "render_wait": "2s",
+  "save_dir": "wired-pages",
+  "output": "wired.jsonl",
+  "user_agent": "my-spider-demo/0.2",
+  "timeout": "30s",
+  "max_attempts": 2,
+  "retry_base_delay": "1s",
+  "retry_max_delay": "4s",
+  "global_qps": 2,
+  "domain_qps": {
+    "www.wired.com": 1
+  },
+  "log_level": "info"
+}

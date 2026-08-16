@@ -24,10 +24,14 @@ V3 并发架构：单协调者 + Worker 执行池。协调者是唯一碰 Schedu
 ## 快速开始
 
 ```bash
-go test ./...                                   # 49 个单元测试（httptest 本地服务器，离线可跑）
-go run ./cmd/quotes                             # 演示爬虫：默认配置（8 worker）
-go run ./cmd/quotes -config config.example.json # 配置化：并发/限流/重试/优先级/落盘
+go test ./...                            # 全部单元测试（httptest 本地服务器，离线可跑）
+go run ./cmd/quotes                      # 演示爬虫：默认配置（8 worker）
+go run ./cmd/quotes -config configs/example.json   # 配置化：并发/限流/重试/优先级/落盘
+go run ./cmd/rss -limit 5                # 真实场景：The Verge RSS → 文章页抓取
+go run ./cmd/wired -limit 5              # 真实场景：列表页解析 + HTTP→CDP 降级 + 低频抓取
 ```
+
+`cmd/rss` 展示"RSS 发现 → 页面抓取"的两级数据流：框架的 `ParseRSS` 解析 RSS 2.0 / RSS 1.0(RDF) / Atom 提取条目链接（自动识别格式，含 ISO-8859-1 字符集转换），Spider 决定入队策略；文章页下载后提取标题（og:title），输出含页面体积等字段。
 
 - stdout 输出 item（JSON 行），stderr 输出结构化日志（JSON 行），`> out.jsonl` 可分离两者
 - 运行中按 `Ctrl-C` 触发 graceful shutdown：停止调度新请求 → 取消在途下载 → 已完成的 item 照常落盘 → 退出
@@ -96,8 +100,9 @@ func main() {
 |---|---|---|
 | `worker` | `8` | 并发 worker 数；IO 密集，上限 ≈ min(限流并发, 内存/句柄预算) |
 | `scheduler` | `fifo` | `fifo` 或 `priority`（`Request.Priority` 大值优先，同级 FIFO） |
-| `downloader` | `http` | `http`（net/http）或 `cdp`（驱动真实 Chrome，见下） |
+| `downloader` | `http` | `http`（net/http）、`cdp`（驱动真实 Chrome，见下）或 `fallback`（HTTP 优先，传输失败/403/429 时惰性降级 CDP） |
 | `render_wait` | `0` | CDP 模式：load 事件后的额外渲染等待（如 `"2s"`，等异步数据上屏） |
+| `save_dir` | 空 | 非空则把每个成功响应的原文保存到该目录（中间件实现，只存最终成功版；路径写入 `Meta["saved_path"]`） |
 | `output` | 空 | 非空则追加 JSONL 文件管道（追加模式，不覆盖历史） |
 | `sqlite` | 空 | 非空则追加 SQLite 管道（数据库文件路径） |
 | `sqlite_table` | `items` | SQLite 表名（白名单校验） |
@@ -130,7 +135,7 @@ func main() {
 `sqlite` 配置为文件路径即可落库（与 `output` JSONL 可同时启用）：
 
 ```bash
-go run ./cmd/quotes -config config.example.json   # 修改配置加 "sqlite": "quotes.db"
+go run ./cmd/quotes -config configs/example.json   # 修改配置加 "sqlite": "quotes.db"
 sqlite3 quotes.db "SELECT json_extract(data,'$.author'), COUNT(*) FROM items GROUP BY 1;"
 ```
 
@@ -150,19 +155,18 @@ sqlite3 quotes.db "SELECT json_extract(data,'$.author'), COUNT(*) FROM items GRO
 
 ## 项目结构
 
+按模块边界组织为 8 个包，依赖方向严格单向（engine → 各组件 → spider 核心类型）：
+
 ```
-request.go / response.go   统一请求/响应抽象，ParseFunc 随请求走
-scheduler.go               Scheduler 接口 + FIFO / Priority(container/heap) 实现
-downloader.go              Downloader 接口 + net/http 实现（连接池、body 生命周期）
-cdp.go                     CDP 下载器：chromedp 驱动真实 Chrome（JS 渲染、反指纹）
-middleware.go              Middleware/Handle/Chain 洋葱机制 + UA/Logging 中间件
-retry.go                   Retry 中间件：错误分类 + 指数退避 + 抖动
-ratelimit.go               RateLimit 中间件：自写令牌桶，全局 + 域名两级
-dedup.go                   Duper 接口 + sha256 Hash Set 去重
-config.go                  JSON 配置 + 引擎组装工厂
-engine.go                  单协调者 + Worker Pool（取消传播、停机、无锁统计）
-pipeline.go                Pipeline 接口 + Console / JSONL 文件实现
-sqlite.go                  SQLite 管道：modernc.org/sqlite（纯 Go，无 cgo）
-cmd/quotes/                演示爬虫
-config.example.json        配置示例
+spider/          核心数据类型：Request / Response / Item / Result / ParseFunc
+scheduler/       Scheduler 接口 + FIFO / Priority(container/heap) 实现
+downloader/      Downloader 接口 + HTTP / CDP(chromedp) / Fallback 降级实现
+middleware/      洋葱机制（Handle/Middleware/Chain）+ UA/Logging/Retry/RateLimit/Save
+dedup/           Duper 接口 + sha256 Hash Set 去重
+pipeline/        Pipeline 接口 + Console / JSONL 文件 / SQLite 实现
+rss/             RSS 2.0 / RSS 1.0(RDF) / Atom 解析（含字符集转换）
+engine/          单协调者 + Worker Pool、Graceful Shutdown、JSON 配置与组装工厂
+cmd/             quotes（演示）/ rss（订阅源抓取）/ wired（列表页 + 降级）
+configs/         各场景示例配置
+docs/            设计决策记录（design-log）
 ```

@@ -171,3 +171,58 @@ Priority（V4 优先级队列才消费）、RetryCount（V3 重试才消费）�
 **注入防护**：表名不能走占位符参数，必须白名单校验（`^[A-Za-z_][A-Za-z0-9_]*$`）后拼接——SQL 注入的非常规入口。
 
 **踩坑**：引擎组装后若从未 Run，`closeResources` 不会执行，Windows 下未关闭的 SQLite 句柄会锁住临时文件（`t.TempDir` 清理失败）。测试中显式收尾；也说明"资源生命周期绑定在 Run 上"的契约需要在文档中明示。
+
+## 015 RSS 解析与第二次死锁（2026-08-16）
+
+**RSS 的架构定位**：格式级解析（XML → 条目列表）进框架（`rss.go`，与 JSON 解析同级）；"把链接变成请求去抓"是抓取策略，留在 Spider 层组合。`ParseRSS` 支持 RSS 2.0 与 Atom 自动识别；Atom 的链接取 `rel` 为空或 alternate（人类可读页），跳过 rel=self。
+
+**第二次死锁（真实场景测试抓出来的）**：RSS 一轮解析产出 3 个链接，引擎随即死锁——goroutine 转储显示协调者阻塞在投喂的 `jobs <- req`，worker 阻塞在 `results <-`。根因：V3 死锁修复后的简化删掉了投喂循环里"顺手回收结果"的 select 分支，依据是一条错误的不变量——"results 缓冲 = worker 数 ⇒ 发送永不阻塞"。反例：worker 发出结果后**不必等协调者回收**就会去接下一个 job，单个 worker 即可压着两个未回收结果，塞满缓冲后 worker 卡在发送、不再回到 jobs 接收端，协调者卡在投喂。既有测试全是"每轮只产一个新请求"的链式拓扑，从未覆盖多轮派发。修复：投喂 select 恢复 `jobs<-req / <-results / ctx.Done` 三分支——发不出去时先回收结果把 worker 腾出来。回归测试：RSS 爬取用例 + 并发测试加到 12 请求（超过两轮派发）。教训：**不变量论证错一句就是死锁；测试拓扑必须覆盖"宽产出"（一轮多个子请求），只有链式不够**。011 的"无死锁论证"以本条为准修正。
+
+## 016 SaveResponseMiddleware：响应原文落盘（2026-08-16）
+
+**问题：保存网页原文的正确位置在哪？**
+
+- A. 解析函数把 HTML 塞进 Item → 现有管道可用，但 Item 臃肿、SQLite 一行存整页
+- B. 新增落盘管道 → **走不通**：Pipeline 接口只见 Item，看不到 Response
+- C. **中间件** → 响应阶段天然拿得到完整 body，业务零感知，与其他管道并存
+
+→ **采用 C**。这是 Pipeline 接口设计的必然推论：管道面向"提取后的结构化数据"，原文保存是传输层的横切关注点，归属中间件。
+
+**链上位置**：必须在 Retry 外层——只保存最终成功的响应，重试途中的 429/5xx 中间产物不落盘（有专门测试锁定该语义：2 次 503 + 1 次 200 → 目录恰好 1 个文件）。
+
+**语义**：保存失败只记 Warn、不影响抓取（辅助能力不应拖死主流程，有测试）；成功把路径写入 `Meta["saved_path"]`，解析函数可带上 Item 形成"元数据 → 原文"的索引闭环。文件名 = URL 末段（净化非法字符、截断 80 字符）+ URL 哈希前 4 字节（防冲突）；扩展名按 Content-Type 推断（html/xml/json/bin）。
+
+**真实场景验证**（The Verge）：6 个响应全部落盘——RSS 源正确得到 `.xml`（按 Content-Type），5 篇文章 `.html`，文件大小与 Item 的 bytes 字段逐一对上，jsonl 里每条记录携带原文路径。
+
+## 017 第二个真实订阅源：RSS 1.0 (RDF) 与字符集（2026-08-16）
+
+**换了 Slashdot 一测，立刻暴露三个格式问题**——这就是真实场景测试的价值：
+
+1. **RSS 1.0 (RDF) 的条目与 channel 平级**（根元素是 `<rdf:RDF>`，`<item>` 不在 `<channel>` 内）。修复：结构体同时收两个位置的 item，RSS 2.0 与 RDF 一套结构通吃。
+2. **声明编码是 ISO-8859-1**，而 Go 的 `encoding/xml` 只接受 UTF-8。修复：用官方预留的 `Decoder.CharsetReader` 钩子做转换——Latin-1 的字节值即 Unicode 码点，按字节映射即可，无需引 `golang.org/x/text`。
+3. **RDF 的发布时间在 Dublin Core 的 `<dc:date>`** 而非 `<pubDate>`。修复：结构体多收一个字段（encoding/xml 按局部名匹配，忽略命名空间前缀），`firstNonEmpty` 取值。
+
+**顺带的工程改进**：解析失败的错误信息现在携带 RSS/Atom 两种格式各自的失败原因（此前被"无法识别"一句话掩盖，这次定位全靠日志里贴出的文档开头）。测试用 `\xE9` 构造真实 Latin-1 字节验证转换，而非 UTF-8 假样本。
+
+## 018 FallbackDownloader：HTTP 优先、失败降级 CDP（2026-08-16）
+
+**问题：列表页 + 文章页抓取，部分站点会拦截直连。**
+
+**方案**：下载器层的组合实现 `FallbackDownloader{primary, secondary}`——降级是"下载方式选择"，归属 Downloader 实现层，引擎与中间件零改动（Downloader 接口第三次兑现）。**判定集合**：传输错误或 403/429（典型反爬拦截）；404/500 不降级（那是业务语义，归重试/解析管）。双侧失败返回**降级侧**错误（更接近问题最新状态）。
+
+**惰性启动**：CDP 由 `lazyCDP`（sync.Once）包装，首次降级才拉起 Chrome——全程 HTTP 成功的运行不付浏览器成本。真实跑 Wired 时 HTTP 全部直连成功，Chrome 全程未启动，恰好验证了这一点。
+
+**已知取舍**：限流在降级层之外，一次降级序列（HTTP+CDP 两次真实访问）只取一个令牌；降级是少数路径，接受并记录。降级与 Retry 的组合顺序：Retry(Fallback(HTTP, CDP))——重试的每次尝试内部先 HTTP 后 CDP。
+
+**礼貌性配置**（用户要求低并发低频）：`worker: 2`、`domain_qps: {www.wired.com: 1}`、`global_qps: 2`、`max_attempts: 2`。Wired 文章页 1.4~1.6MB/篇，低频也是对自己带宽的节约。
+
+
+## 019 按模块边界拆包（2026-08-16）
+
+**时机**：V1 时单包是有意为之（"拆包也容易"），现在拆是因为 8 个模块边界经四个版本 + 五次真实场景验证后已经稳定——拆包是把验证过的边界物理化，而不是提前猜边界。
+
+**粒度**：按**接口缝**拆，不按文件拆——`spider`（核心数据类型：Request/Response/Item/Result/ParseFunc）、`scheduler`、`downloader`（HTTP/CDP/Fallback）、`middleware`（链 + 四个实现）、`dedup`、`pipeline`（三种实现）、`rss`、`engine`（引擎 + 配置 + 组装工厂）。依赖严格单向：engine → 各组件 → spider；spider 零依赖。测试随实现走（引擎级测试移入 engine 包），跨包仅 testLogger 一行重复——不值得为此引入 testutil 包。
+
+**代价与收获**：收获是物理边界强制低耦合（scheduler 无法伸手摸 downloader 的内部）+ 72 个测试按包独立运行（改中间件只跑 middleware 包的测试）；代价是引用要带包名、`lazyCDP` 等内部构造器需要导出（`NewLazyCDP`）。单包 vs 多包在此规模都成立——拆是因为边界已验证稳定且被明确要求，不是因为单包错误。
+
+**机械重构的方法教训**：批量 sed/python 替换会产生"字段名被误限定"（`Duper dedup.Duper`）、"函数名被误伤"（`TestEngineWithRetryMiddleware` → `TestEngineWithmiddleware.RetryMiddleware`）、"双限定"（`scheduler.scheduler.`）三类损伤——全部被 `go vet` 逐个暴露，修完 72 测试零丢失。工具能加速机械部分，边界（）和上下文（函数名、字段名）仍要人盯。
