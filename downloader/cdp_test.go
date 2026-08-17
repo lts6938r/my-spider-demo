@@ -20,10 +20,11 @@ const jsPage = `<!doctype html>
 </body></html>`
 
 // newCDPorSkip 启动 CDP 下载器；机器上没有 Chrome 时跳过测试。
+// 使用真实浏览器模式（非 headless）以通过反检测测试。
 func newCDPorSkip(t *testing.T) *CDPDownloader {
 	t.Helper()
 	d, err := NewCDPDownloader(CDPConfig{
-		Headless: true,
+		Headless: false,
 		Timeout:  15 * time.Second,
 		Wait:     600 * time.Millisecond, // 等 setTimeout(100ms) 上屏
 	})

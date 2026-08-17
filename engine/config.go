@@ -36,6 +36,8 @@ type Config struct {
 	GlobalQPS      float64            `json:"global_qps"`       // <=0 不限
 	DomainQPS      map[string]float64 `json:"domain_qps"`       // 只对列出的域名生效
 	LogLevel       string             `json:"log_level"`        // debug/info/warn/error
+	CDPAddr        string             `json:"cdp_addr"`         // CDP 调试地址（如 127.0.0.1:9222）；空则自动启动 headless
+	CDPProfileDir  string             `json:"cdp_profile_dir"`  // CDP Chrome 用户数据目录；空 = 临时目录
 }
 
 func DefaultConfig() *Config {
@@ -128,29 +130,33 @@ func NewEngineFromConfig(cfg *Config, duper dedup.Duper, pipes ...pipeline.Pipel
 		mws = append(mws, middleware.UserAgentMiddleware(cfg.UserAgent))
 	}
 
-	// 下载器可替换：HTTP（net/http）、CDP（真实浏览器）或
-	// fallback（HTTP 优先，失败/被拦截时惰性降级 CDP），引擎无感知
-	var down downloader.Downloader = downloader.NewHTTPDownloader(cfg.Timeout.Duration)
-	switch strings.ToLower(cfg.Downloader) {
-	case "cdp":
-		d, err := downloader.NewCDPDownloader(downloader.CDPConfig{
-			Headless: true,
-			Timeout:  cfg.Timeout.Duration,
-			Wait:     cfg.RenderWait.Duration,
-		})
-		if err != nil {
-			return nil, err
+// 下载器可替换：HTTP（net/http）、CDP（真实浏览器）或
+		// fallback（HTTP 优先，失败/被拦截时惰性降级 CDP），引擎无感知
+		//
+		// CDP 模式策略：Headless=false 永不 headless，配合 UserAgent 覆盖反检测。
+		// cdp_addr 非空时先尝试 attach，失败则自动在指定地址启动真实 Chrome。
+		// cdp_addr 为空时自动分配端口启动真实 Chrome（非 headless 持久 profile）。
+		var down downloader.Downloader = downloader.NewHTTPDownloader(cfg.Timeout.Duration)
+		cdpCfg := downloader.CDPConfig{
+			Headless:   false,
+			Timeout:    cfg.Timeout.Duration,
+			Wait:       cfg.RenderWait.Duration,
+			Addr:       cfg.CDPAddr,
+			UserAgent:  cfg.UserAgent,
+			ProfileDir: cfg.CDPProfileDir,
 		}
-		down = d
-	case "fallback":
-		down = downloader.NewFallbackDownloader(
-			downloader.NewHTTPDownloader(cfg.Timeout.Duration),
-			downloader.NewLazyCDP(downloader.CDPConfig{
-				Headless: true,
-				Timeout:  cfg.Timeout.Duration,
-				Wait:     cfg.RenderWait.Duration,
-			}))
-	}
+		switch strings.ToLower(cfg.Downloader) {
+		case "cdp":
+			d, err := downloader.NewCDPDownloader(cdpCfg)
+			if err != nil {
+				return nil, err
+			}
+			down = d
+		case "fallback":
+			down = downloader.NewFallbackDownloader(
+				downloader.NewHTTPDownloader(cfg.Timeout.Duration),
+				downloader.NewLazyCDP(cdpCfg))
+		}
 
 	// 调度器可替换：同一 Scheduler 接口的两种实现，引擎无感知
 	var sched scheduler.Scheduler = scheduler.NewFIFOScheduler()

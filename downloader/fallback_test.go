@@ -142,11 +142,11 @@ func TestFallbackE2ERealCDP(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cdp, err := NewCDPDownloader(CDPConfig{
-		Headless: true,
-		Timeout:  15 * time.Second,
-		Wait:     600 * time.Millisecond,
-	})
+cdp, err := NewCDPDownloader(CDPConfig{
+			Headless: false,
+			Timeout:  15 * time.Second,
+			Wait:     600 * time.Millisecond,
+		})
 	if err != nil {
 		t.Skipf("本机无法启动 Chrome，跳过: %v", err)
 	}
